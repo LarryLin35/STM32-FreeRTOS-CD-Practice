@@ -1,0 +1,52 @@
+name: STM32_FreeRTOS_Production_CD
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 產生 Release 需要權限
+      packages: write   # 產生 Image 需要權限
+
+    steps:
+      - name: 1. 檢出程式碼
+        uses: actions/checkout@v4
+
+      - name: 2. 在 Docker 中編譯韌體
+        run: |
+          docker run --rm -v $(pwd):/app -w /app \
+          bitnami/minideb:latest \
+          bash -c "apt-get update && apt-get install -y curl make gcc-arm-none-eabi && make"
+          # 註：確保你的 Makefile 最後會產生 firmware.bin
+
+      - name: 3. 登入 GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 4. 建立並推送 Docker Image (包含韌體)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # 標籤會像這樣：ghcr.io/你的帳號/repo名字:latest
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+      - name: 5. 產生 GitHub Release (僅限 main 分支)
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Release v1.0.${{ github.run_number }}
+          files: firmware.bin
+          draft: false
+          prerelease: false
