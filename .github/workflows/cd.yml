@@ -1,96 +1,78 @@
-# 1. 自動化流程的名字：STM32 生產級持續部署流程
-name: STM32_FreeRTOS_Production_CD
+name: STM32_Main_Production_Pipeline
 
-# 2. 觸發條件：當 main (正式版) 或 dev (開發版) 分支有 push 時啟動
 on:
   push:
     branches:
       - main
-      - dev
+  pull_request:
+    branches:
+      - main
 
-# 3. 工作任務
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
-    
-    # 設置執行權限：允許寫入 GitHub Release 與 GitHub Packages (Docker Image)
     permissions:
       contents: write
       packages: write
 
     steps:
-      # 第一步：下載原始碼
-      - name: 1. 檢出程式碼 (Checkout)
+      - name: 1. 檢出程式碼
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 獲取所有歷史紀錄以便打 Tag
 
-      # 第二步：使用 Docker 進行交叉編譯
-      # 我們在這裡產出最原始的 firmware.bin
-      - name: 2. 在 Docker 中編譯原始韌體
+      - name: 2. 在 Docker 中編譯韌體
         run: |
           docker run --rm -v $(pwd):/app -w /app \
           bitnami/minideb:latest \
-          bash -c "
-            apt-get update && \
-            apt-get install -y curl make gcc-arm-none-eabi && \
-            make
-          "
-          # 註：編譯完成後，工作目錄下應出現 firmware.bin
+          bash -c "apt-get update && apt-get install -y curl make gcc-arm-none-eabi && make"
 
-      # --- 關鍵新增步驟：執行打包與校驗 ---
-      # 這裡會跑你的 pack.py，把 Magic Number 和 SHA-256 黏上去
-      - name: 3. 執行 Python 打包與 SHA-256 計算
+      - name: 3. 執行 Python 韌體打包 (SHA-256)
         run: |
-          # 執行你寫的打包腳本，產出 production_package.bin
           python3 pack.py
-          
-          # 另外產生一個純文字的校驗檔，方便人類直接在網頁上看
           sha256sum firmware.bin > firmware.bin.sha256
-          echo "打包完成！SHA-256 指紋為："
-          cat firmware.bin.sha256
 
-      # 第四步：登入 GitHub 容器註冊表
+      # --- 以下步驟僅在「真正推送到 main」(包含 PR 合併後) 才執行 ---
+      # PR 階段只會跑上面的編譯測試，確保不會壞掉
+
       - name: 4. 登入 GitHub Container Registry (GHCR)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 第五步：處理命名規範
-      - name: 5. 處理 Image 名稱轉為小寫
+      - name: 5. 處理 Image 名稱轉小寫
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           echo "IMAGE_ID=$(echo ghcr.io/${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
-      # 第六步：封裝 Image 並推送
-      # 注意：Dockerfile 會把編譯產出的檔案包進去
-      - name: 6. 封裝並推送 Docker Image
+      - name: 6. 封裝並推送 Package
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           tags: |
             ${{ env.IMAGE_ID }}:latest
-            ${{ env.IMAGE_ID }}:${{ github.sha }}
+            ${{ env.IMAGE_ID }}:v1.0.${{ github.run_number }}
 
-      # 第七步：發佈正式版本 (僅限 main 分支)
-      # 當你從 dev 合併到 main 時，這步會把「身分證包」掛上去
-      - name: 7. 產生 GitHub Release (僅限 main 分支)
-        if: github.ref == 'refs/heads/main'
+      - name: 7. 自動產生 Release 與 Tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v1
         with:
+          # 這行會自動幫你建立 Git Tag
           tag_name: v1.0.${{ github.run_number }}
           name: Release v1.0.${{ github.run_number }}
-          # 同時上傳三種檔案，滿足不同需求
           files: |
             firmware.bin
             production_package.bin
             firmware.bin.sha256
-          # 在 Release 頁面直接顯示說明內容，不用下載也能對帳
           body: |
-            ### 🚀 自動化編譯報告
-            - **原始檔案 SHA-256**: `$(cat firmware.bin.sha256 | awk '{print $1}')`
-            - **OTA 專用包**: `production_package.bin` (含 Magic Number 0xABCD1234)
-            - **編譯時間**: ${{ github.event.head_commit.timestamp }}
-            - **Commit ID**: ${{ github.sha }}
+            ## 🚀 正式發佈報告
+            - **版本號**: v1.0.${{ github.run_number }}
+            - **原始 SHA-256**: `$(cat firmware.bin.sha256 | awk '{print $1}')`
+            - **打包說明**: 已包含 Magic Number 與校驗 Header。
           draft: false
           prerelease: false
