@@ -1,81 +1,78 @@
-# 1. 自動化流程的名字
-name: STM32_FreeRTOS_Production_CD
+name: STM32_Main_Production_Pipeline
 
-# 2. 觸發條件：當 main 或 dev 分支有程式碼推送 (push) 時觸發
 on:
   push:
     branches:
       - main
-      - dev
+  pull_request:
+    branches:
+      - main
 
-# 3. 工作內容
 jobs:
   build-and-release:
-    # 執行環境使用最新的 Ubuntu 虛擬機
     runs-on: ubuntu-latest
-    
-    # 給予這個腳本權限：write contents (寫入 Release) 和 write packages (上傳 Docker Image)
     permissions:
       contents: write
       packages: write
 
     steps:
-      # 第一步：把你在 GitHub 上的原始碼下載到這台虛擬機中
-      - name: 1. 檢出程式碼 (Checkout)
+      - name: 1. 檢出程式碼
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 獲取所有歷史紀錄以便打 Tag
 
-      # 第二步：環境隔離與編譯
-      # 為什麼用 Docker？因為你不需要在虛擬機裝環境，直接用容器裡的編譯器。
-      - name: 2. 在 Docker 容器中執行 Makefile 編譯
+      - name: 2. 在 Docker 中編譯韌體
         run: |
-          # --rm: 執行完就刪除容器 | -v: 把目前的目錄掛載進去 | -w: 指定工作目錄為 /app
           docker run --rm -v $(pwd):/app -w /app \
           bitnami/minideb:latest \
-          bash -c "
-            apt-get update && \
-            apt-get install -y curl make gcc-arm-none-eabi && \
-            make
-          "
-          # 註：這裡會根據你的 Makefile 產出一個 firmware.bin 檔案。
+          bash -c "apt-get update && apt-get install -y curl make gcc-arm-none-eabi && make"
 
-      # 第三步：準備上傳 Image
-      # 要把東西推送到 GitHub 的倉庫 (GHCR)，必須先登入。
-      - name: 3. 登入 GitHub Container Registry (GHCR)
+      - name: 3. 執行 Python 韌體打包 (SHA-256)
+        run: |
+          python3 pack.py
+          sha256sum firmware.bin > firmware.bin.sha256
+
+      # --- 以下步驟僅在「真正推送到 main」(包含 PR 合併後) 才執行 ---
+      # PR 階段只會跑上面的編譯測試，確保不會壞掉
+
+      - name: 4. 登入 GitHub Container Registry (GHCR)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }} # 你的 GitHub 帳號
-          password: ${{ secrets.GITHUB_TOKEN }} # GitHub 自動產生的臨時金鑰
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 第四步：處理 Docker 的規範限制
-      # Docker 的 Image 名稱嚴禁大寫字母，但 GitHub Repo 名字通常有大寫。
-      - name: 4. 處理 Image 名稱轉為全小寫
+      - name: 5. 處理 Image 名稱轉小寫
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          # 將路徑轉小寫後存入 $GITHUB_ENV 環境變數，供後續步驟使用
           echo "IMAGE_ID=$(echo ghcr.io/${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
-      # 第五步：封裝並推送 Image
-      # 這一點很重要：這會讀取你 Repo 根目錄的 Dockerfile，把編譯好的 .bin 包進去。
-      - name: 5. 封裝韌體進 Docker Image 並推送至 GitHub Packages
+      - name: 6. 封裝並推送 Package
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          # tags 指定兩個標籤：latest (最新版) 和具體的 git hash 版本
           tags: |
             ${{ env.IMAGE_ID }}:latest
-            ${{ env.IMAGE_ID }}:${{ github.sha }}
+            ${{ env.IMAGE_ID }}:v1.0.${{ github.run_number }}
 
-      # 第六步：正式發佈 (僅在推送到 main 分支時執行)
-      # 如果你改的是 dev，這一步會自動跳過。
-      - name: 6. 產生 GitHub Release 版本 (僅限 main 分支)
-        if: github.ref == 'refs/heads/main'
+      - name: 7. 自動產生 Release 與 Tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v1
         with:
-          # 版本號：使用 v1.0 加上 GitHub 的執行序號 (例如 v1.0.5)
+          # 這行會自動幫你建立 Git Tag
           tag_name: v1.0.${{ github.run_number }}
           name: Release v1.0.${{ github.run_number }}
-          # 要掛在 Release 頁面讓別人下載的檔案
-          files: firmware.bin
+          files: |
+            firmware.bin
+            production_package.bin
+            firmware.bin.sha256
+          body: |
+            ## 🚀 正式發佈報告
+            - **版本號**: v1.0.${{ github.run_number }}
+            - **原始 SHA-256**: `$(cat firmware.bin.sha256 | awk '{print $1}')`
+            - **打包說明**: 已包含 Magic Number 與校驗 Header。
           draft: false
           prerelease: false
