@@ -1,34 +1,32 @@
-# 1. 自動化流程的名字
+# 1. 自動化流程的名字：STM32 生產級持續部署流程
 name: STM32_FreeRTOS_Production_CD
 
-# 2. 觸發條件：當 main 或 dev 分支有程式碼推送 (push) 時觸發
+# 2. 觸發條件：當 main (正式版) 或 dev (開發版) 分支有 push 時啟動
 on:
   push:
     branches:
       - main
       - dev
 
-# 3. 工作內容
+# 3. 工作任務
 jobs:
   build-and-release:
-    # 執行環境使用最新的 Ubuntu 虛擬機
     runs-on: ubuntu-latest
     
-    # 給予這個腳本權限：write contents (寫入 Release) 和 write packages (上傳 Docker Image)
+    # 設置執行權限：允許寫入 GitHub Release 與 GitHub Packages (Docker Image)
     permissions:
       contents: write
       packages: write
 
     steps:
-      # 第一步：把你在 GitHub 上的原始碼下載到這台虛擬機中
+      # 第一步：下載原始碼
       - name: 1. 檢出程式碼 (Checkout)
         uses: actions/checkout@v4
 
-      # 第二步：環境隔離與編譯
-      # 為什麼用 Docker？因為你不需要在虛擬機裝環境，直接用容器裡的編譯器。
-      - name: 2. 在 Docker 容器中執行 Makefile 編譯
+      # 第二步：使用 Docker 進行交叉編譯
+      # 我們在這裡產出最原始的 firmware.bin
+      - name: 2. 在 Docker 中編譯原始韌體
         run: |
-          # --rm: 執行完就刪除容器 | -v: 把目前的目錄掛載進去 | -w: 指定工作目錄為 /app
           docker run --rm -v $(pwd):/app -w /app \
           bitnami/minideb:latest \
           bash -c "
@@ -36,46 +34,63 @@ jobs:
             apt-get install -y curl make gcc-arm-none-eabi && \
             make
           "
-          # 註：這裡會根據你的 Makefile 產出一個 firmware.bin 檔案。
+          # 註：編譯完成後，工作目錄下應出現 firmware.bin
 
-      # 第三步：準備上傳 Image
-      # 要把東西推送到 GitHub 的倉庫 (GHCR)，必須先登入。
-      - name: 3. 登入 GitHub Container Registry (GHCR)
+      # --- 關鍵新增步驟：執行打包與校驗 ---
+      # 這裡會跑你的 pack.py，把 Magic Number 和 SHA-256 黏上去
+      - name: 3. 執行 Python 打包與 SHA-256 計算
+        run: |
+          # 執行你寫的打包腳本，產出 production_package.bin
+          python3 pack.py
+          
+          # 另外產生一個純文字的校驗檔，方便人類直接在網頁上看
+          sha256sum firmware.bin > firmware.bin.sha256
+          echo "打包完成！SHA-256 指紋為："
+          cat firmware.bin.sha256
+
+      # 第四步：登入 GitHub 容器註冊表
+      - name: 4. 登入 GitHub Container Registry (GHCR)
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
-          username: ${{ github.actor }} # 你的 GitHub 帳號
-          password: ${{ secrets.GITHUB_TOKEN }} # GitHub 自動產生的臨時金鑰
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 第四步：處理 Docker 的規範限制
-      # Docker 的 Image 名稱嚴禁大寫字母，但 GitHub Repo 名字通常有大寫。
-      - name: 4. 處理 Image 名稱轉為全小寫
+      # 第五步：處理命名規範
+      - name: 5. 處理 Image 名稱轉為小寫
         run: |
-          # 將路徑轉小寫後存入 $GITHUB_ENV 環境變數，供後續步驟使用
           echo "IMAGE_ID=$(echo ghcr.io/${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
 
-      # 第五步：封裝並推送 Image
-      # 這一點很重要：這會讀取你 Repo 根目錄的 Dockerfile，把編譯好的 .bin 包進去。
-      - name: 5. 封裝韌體進 Docker Image 並推送至 GitHub Packages
+      # 第六步：封裝 Image 並推送
+      # 注意：Dockerfile 會把編譯產出的檔案包進去
+      - name: 6. 封裝並推送 Docker Image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          # tags 指定兩個標籤：latest (最新版) 和具體的 git hash 版本
           tags: |
             ${{ env.IMAGE_ID }}:latest
             ${{ env.IMAGE_ID }}:${{ github.sha }}
 
-      # 第六步：正式發佈 (僅在推送到 main 分支時執行)
-      # 如果你改的是 dev，這一步會自動跳過。
-      - name: 6. 產生 GitHub Release 版本 (僅限 main 分支)
+      # 第七步：發佈正式版本 (僅限 main 分支)
+      # 當你從 dev 合併到 main 時，這步會把「身分證包」掛上去
+      - name: 7. 產生 GitHub Release (僅限 main 分支)
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v1
         with:
-          # 版本號：使用 v1.0 加上 GitHub 的執行序號 (例如 v1.0.5)
           tag_name: v1.0.${{ github.run_number }}
           name: Release v1.0.${{ github.run_number }}
-          # 要掛在 Release 頁面讓別人下載的檔案
-          files: firmware.bin
+          # 同時上傳三種檔案，滿足不同需求
+          files: |
+            firmware.bin
+            production_package.bin
+            firmware.bin.sha256
+          # 在 Release 頁面直接顯示說明內容，不用下載也能對帳
+          body: |
+            ### 🚀 自動化編譯報告
+            - **原始檔案 SHA-256**: `$(cat firmware.bin.sha256 | awk '{print $1}')`
+            - **OTA 專用包**: `production_package.bin` (含 Magic Number 0xABCD1234)
+            - **編譯時間**: ${{ github.event.head_commit.timestamp }}
+            - **Commit ID**: ${{ github.sha }}
           draft: false
           prerelease: false
